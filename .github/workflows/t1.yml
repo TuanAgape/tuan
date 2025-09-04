@@ -9,14 +9,15 @@ permissions:
   contents: read
   actions: read
 
-# KHÓA không cho chạy song song trên cùng 1 nhánh (main)
+# KHÓA theo TỪNG FILE WORKFLOW, không chặn file khác
+# -> mỗi *.yml chạy song song được; riêng từng file vẫn chỉ 1 run tại một thời điểm
 concurrency:
-  group: nexus-cli-${{ github.ref_name }}
-  cancel-in-progress: false   # run mới sẽ xếp hàng đợi, KHÔNG hủy run cũ
+  group: ${{ github.workflow_ref }}      # ví dụ: owner/repo/.github/workflows/t3.yml@refs/heads/main
+  cancel-in-progress: false              # run mới sẽ đợi, không hủy run cũ (để kịp backup)
 
 env:
-  NODE_IDS: "35843178 35904246 35904254 35843221"
-  LOG_MAX_MB: "50"            # giới hạn log khi snapshot (MB)
+  NODE_IDS: "35947382 36000560 36000560 35943861"
+  LOG_MAX_MB: "50"  # giới hạn log trong snapshot (MB)
 
 jobs:
   nexus:
@@ -83,7 +84,7 @@ jobs:
             export PATH="$HOME/.nexus/bin:$PATH"
             command -v nexus-network && nexus-network --version || true
 
-            # Vòng lặp + watchdog nhẹ (nếu log đứng > 15m thì restart)
+            # Watchdog: nếu log đứng > 15 phút thì restart
             IDLE_MAX_MIN=${IDLE_MAX_MIN:-15}
             while true; do
               echo "[$(date -Is)] starting node ${NODE_ID}"
@@ -92,9 +93,15 @@ jobs:
               while kill -0 "$NPID" 2>/dev/null; do
                 sleep 60
                 if [ -f "${LOG_FILE}" ]; then
-                  LAST=$(stat -c %Y "${LOG_FILE}")
+                  LAST=$(stat -c %Y "${LOG_FILE}") || LAST=0
                   NOW=$(date +%s)
-                  (( NOW - LAST > IDLE_MAX_MIN*60 )) && { echo "[$(date -Is)] no log > ${IDLE_MAX_MIN}m → restart ${NODE_ID}"; kill -TERM "$NPID" 2>/dev/null || true; sleep 5; kill -KILL "$NPID" 2>/dev/null || true; }
+                  if [ $((NOW - LAST)) -gt $((IDLE_MAX_MIN*60)) ]; then
+                    echo "[$(date -Is)] no log > ${IDLE_MAX_MIN}m → restart ${NODE_ID}"
+                    kill -TERM "$NPID" 2>/dev/null || true
+                    sleep 5
+                    kill -KILL "$NPID" 2>/dev/null || true
+                    break
+                  fi
                 fi
               done
               echo "[$(date -Is)] node ${NODE_ID} exited, restart in 15s..."
@@ -104,12 +111,11 @@ jobs:
           chmod +x /opt/state/start-nexus.sh
           head -n 20 /opt/state/start-nexus.sh
 
-      # 4) Khởi chạy 4 node trong tmux socket riêng 'nexus'
+      # 4) Khởi chạy 4 node trong tmux socket riêng 'nexus' (stagger + nice/ionice)
       - name: Start 4 Nexus nodes in tmux (stagger + nice/ionice)
         shell: bash
         run: |
           set -euxo pipefail
-          # Dừng session cũ nếu trùng tên (trên CÙNG runner/VM hiện tại)
           for ID in $NODE_IDS; do
             tmux -L nexus has-session -t "node${ID}" 2>/dev/null && tmux -L nexus kill-session -t "node${ID}" || true
           done
@@ -123,7 +129,7 @@ jobs:
           done
           tmux -L nexus ls || true
 
-      # 5) SSH debug: thủ công, hoặc bật qua repo variable ENABLE_TMATE=1 để debug khi cron
+      # 5) SSH debug (thủ công; hoặc bật ở cron bằng repo variable ENABLE_TMATE=1)
       - name: Open tmate (debug)
         if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_TMATE == '1' }}
         uses: mxschmitt/action-tmate@v3
